@@ -1,0 +1,223 @@
+// src/Catalog.API/Infrastructure/NATS/NatsConnectionProvider.cs
+using NATS.Client.Core;
+using NATS.Client.JetStream;
+using NATS.Client.JetStream.Models;
+using Microsoft.Extensions.Options;
+
+namespace Catalog.API.Infrastructure.NATS;
+
+public interface INatsConnectionProvider
+{
+    INatsConnection GetConnection();
+    INatsJSContext GetJetStreamContext();
+}
+
+public class NatsConnectionProvider : INatsConnectionProvider, IAsyncDisposable
+{
+    private readonly NatsOpts _opts;
+    private INatsConnection? _connection;
+    private INatsJSContext? _jsContext;
+    private readonly SemaphoreSlim _semaphore = new(1, 1);
+
+    public NatsConnectionProvider(IOptions<NatsOptions> options)
+    {
+        var opt = options.Value;
+        _opts = new NatsOpts
+        {
+            Url = opt.Url,
+            Name = "catalog-api",
+            ReconnectWait = TimeSpan.FromSeconds(2),
+            MaxReconnect = -1,  // Infinite reconnects
+            PingInterval = TimeSpan.FromSeconds(20),
+            MaxPingsOut = 3,
+            AuthOpts = new NatsAuthOpts
+            {
+                Username = opt.Username,
+                Password = opt.Password
+            }
+        };
+    }
+
+    public async Task<INatsConnection> GetConnectionAsync()
+    {
+        await _semaphore.WaitAsync();
+        try
+        {
+            if (_connection is null || _connection.ConnectionState != NatsConnState.Open)
+            {
+                _connection = new NatsConnection(_opts);
+                await _connection.ConnectAsync();
+            }
+            return _connection;
+        }
+        finally
+        {
+            _semaphore.Release();
+        }
+    }
+
+    public INatsConnection GetConnection()
+    {
+        _connection ??= new NatsConnection(_opts);
+        return _connection;
+    }
+
+    public INatsJSContext GetJetStreamContext()
+    {
+        _jsContext ??= GetConnection().CreateJetStreamContext();
+        return _jsContext;
+    }
+
+    public async ValueTask DisposeAsync()
+    {
+        if (_connection is not null)
+        {
+            await _connection.DisposeAsync();
+        }
+        _semaphore.Dispose();
+    }
+}
+
+public class NatsOptions
+{
+    public const string SectionName = "NATS";
+    public string Url { get; set; } = "nats://localhost:4222";
+    public string ClusterName { get; set; } = "notification-cluster";
+    public string? Username { get; set; }
+    public string? Password { get; set; }
+    public string StreamName { get; set; } = "";
+    public int DedupWindowMinutes { get; set; } = 5;
+}
+
+// src/Catalog.API/Infrastructure/NATS/NatsStreamSetup.cs
+using NATS.Client.JetStream;
+using NATS.Client.JetStream.Models;
+
+namespace Catalog.API.Infrastructure.NATS;
+
+public interface INatsStreamSetup
+{
+    Task EnsureStreamAndConsumersAsync(CancellationToken ct = default);
+}
+
+public class NatsStreamSetup : INatsStreamSetup
+{
+    private readonly INatsConnectionProvider _provider;
+    private readonly ILogger<NatsStreamSetup> _logger;
+    private readonly NatsOptions _options;
+
+    public NatsStreamSetup(
+        INatsConnectionProvider provider,
+        ILogger<NatsStreamSetup> logger,
+        IOptions<NatsOptions> options)
+    {
+        _provider = provider;
+        _logger = logger;
+        _options = options.Value;
+    }
+
+    public async Task EnsureStreamAndConsumersAsync(CancellationToken ct = default)
+    {
+        var js = _provider.GetJetStreamContext();
+        var streamName = _options.StreamName;
+
+        // ============================================
+        // Stream 1: NOTIFICATIONS - Last only per subject
+        // Mobile clients with MissedPolicy=LastOnly
+        // ============================================
+        try
+        {
+            await js.CreateStreamAsync(new StreamConfig
+            {
+                Name = streamName,
+                Subjects = new[]
+                {
+                    "accounts.>",
+                    "poschannels.>",
+                    "snapshots.>",
+                    "broadcast.>"
+                },
+                Retention = StreamConfigRetentionPolicy.Limits,
+                Discard = StreamConfigDiscardPolicy.Old,
+                MaxMsgsPerSubject = 1,   // Only latest message per subject
+                MaxAge = TimeSpan.FromMinutes(5),
+                MaxBytes = -1,           // Unlimited
+                Storage = StreamConfigStorage.Memory,  // Fast access
+                Replicas = 2,            // 2 replicas in 3-node cluster
+                Duplicates = TimeSpan.FromMinutes(_options.DedupWindowMinutes),
+                AllowDirect = true,      // Enable direct gets
+                NoAck = false
+            }, cancellationToken: ct);
+            
+            _logger.LogInformation("Stream {StreamName} created/updated successfully", streamName);
+        }
+        catch (NatsJSException ex) when (ex.Message.Contains("stream name already in use"))
+        {
+            // Stream exists - update it
+            var stream = await js.GetStreamAsync(streamName, cancellationToken: ct);
+            _logger.LogInformation("Stream {StreamName} already exists with {MsgCount} messages", 
+                streamName, stream.Info.State?.Messages);
+        }
+
+        // ============================================
+        // Stream 2: NOTIFICATIONS_FULL - All messages (for AllMissed policy)
+        // ============================================
+        var fullStreamName = $"{streamName}_FULL";
+        try
+        {
+            await js.CreateStreamAsync(new StreamConfig
+            {
+                Name = fullStreamName,
+                Subjects = new[]
+                {
+                    "accounts.>",
+                    "poschannels.>",
+                    "snapshots.>",
+                    "broadcast.>"
+                },
+                Retention = StreamConfigRetentionPolicy.Limits,
+                Discard = StreamConfigDiscardPolicy.Old,
+                MaxMsgsPerSubject = -1,  // Keep ALL messages
+                MaxAge = TimeSpan.FromHours(24),
+                MaxBytes = 512 * 1024 * 1024,  // 512MB limit
+                Storage = StreamConfigStorage.File,  // Persistent for history
+                Replicas = 2,
+                Duplicates = TimeSpan.FromMinutes(_options.DedupWindowMinutes),
+                AllowDirect = true
+            }, cancellationToken: ct);
+            
+            _logger.LogInformation("Stream {StreamName} created/updated successfully", fullStreamName);
+        }
+        catch (NatsJSException ex) when (ex.Message.Contains("stream name already in use"))
+        {
+            _logger.LogInformation("Stream {StreamName} already exists", fullStreamName);
+        }
+    }
+}
+
+
+
+
+based on what implement in cluster 
+update these and 
+not forget 
+
+/// <summary>
+/// Selects which publish path(s) push catalog changes into NATS JetStream.
+///
+///   Outbox       -> only OutboxRelayService runs (poll every 500ms, guaranteed delivery,
+///                   higher latency: 0-500ms)
+///   ListenNotify -> only ListenNotifyService runs (pg_notify, ~1ms latency, but if this
+///                   service is down between disconnect and reconnect, signals are missed
+///                   — though JetStream still buffers/replays via subject history)
+///   Both         -> both services run. They share the same outbox_message.id as the NATS
+///                   MsgId, so JetStream's 5-minute dedup window collapses duplicate
+///                   publishes into one delivery. This is the recommended production
+///                   setting: low latency AND zero message loss.
+/// </summary>
+public enum PublishMode
+{
+    Outbox,
+    ListenNotify,
+    Both
+}

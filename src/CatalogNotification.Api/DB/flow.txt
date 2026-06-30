@@ -1,0 +1,113 @@
+Complete flow (updated — trigger owns outbox row)
+
+          Database change
+        (any writer: API, raw SQL, migration, batch job)
+                │
+                │
+      BEGIN TRANSACTION
+                │
+                └──────────────► UPDATE service_catalogs
+                                                │
+                                                ▼
+                                  AFTER UPDATE Trigger fires automatically
+                                  (still inside the same transaction)
+                                                │
+                                                ▼
+                                  fn_notify_catalog_changes()
+                                                │
+                                  ┌─────────────┴─────────────┐
+                                  ▼                           ▼
+                    INSERT outbox_messages          pg_notify('catalog_changes', payload)
+                    (id, account, channel,                    │
+                     subject, payload)                        │
+                                  │                            │
+                                  └─────────────┬──────────────┘
+                                                ▼
+                                            COMMIT
+                                  (catalog update + outbox row +
+                                   pending NOTIFY all atomic)
+                                                │
+                                                ▼
+                                  NOTIFY delivered to listeners
+                                                │
+                        ┌───────────────────────┴───────────────────────┐
+                        ▼                                               ▼
+            ListenNotifyService receives event              (if listener is down/disconnected,
+                        │                                     NOTIFY is lost — by design)
+                        ▼                                               │
+        SELECT payload FROM outbox_messages                            │
+        WHERE id = outboxMessageId                                     │
+                        │                                               │
+                        ▼                                               │
+            Publish message to NATS                                    │
+                        │                                               │
+                        ▼                                               │
+        UPDATE outbox_messages                                         │
+        SET processed_at = now()                                       │
+        WHERE id = outboxMessageId                                     │
+        AND processed_at IS NULL                                       │
+                        │                                               ▼
+                        │                              OutboxRelayService (polling, e.g. every 500ms)
+                        │                                               │
+                        │                                               ▼
+                        │                              SELECT * FROM outbox_messages
+                        │                              WHERE processed_at IS NULL
+                        │                                               │
+                        │                                               ▼
+                        │                              Publish message to NATS
+                        │                                               │
+                        │                                               ▼
+                        │                              UPDATE outbox_messages
+                        │                              SET processed_at = now()
+                        │                              WHERE processed_at IS NULL
+                        │                                               │
+                        └───────────────────┬───────────────────────────┘
+                                             ▼
+                        NATS JetStream dedups on MsgId (= outbox id)
+                        if both paths happen to publish the same row
+                        
+                        
+                        
+End-to-end sequence (updated)
+
+Writer (any caller)
+    │
+    ▼
+UPDATE service_catalogs ...
+    │
+    ├── Begin Transaction (implicit if not already in one)
+    │
+    ├── UPDATE service_catalogs (the only statement the writer issues)
+    │
+    ├── AFTER UPDATE Trigger: fn_notify_catalog_changes()
+    │      │
+    │      ├── gen_random_uuid() → outbox id
+    │      ├── INSERT outbox_messages (id, subject, payload, processed_at = NULL)
+    │      └── pg_notify('catalog_changes', json_build_object(outboxMessageId, ...))
+    │           (queued — not delivered until commit)
+    │
+    ├── Commit
+    │      │
+    │      ├── Catalog update committed
+    │      ├── Outbox row committed
+    │      └── NOTIFY delivered to any connected LISTEN sessions
+    │
+    ▼
+ListenNotifyService (fast path)
+    │
+    ├── conn.WaitAsync() unblocks on NOTIFY
+    ├── Parse payload → outboxMessageId
+    ├── SELECT payload FROM outbox_messages WHERE id = outboxMessageId
+    ├── Publish to NATS (subject = catalog.{account}.{channel} or catalog.critical)
+    └── UPDATE outbox_messages SET processed_at = now() WHERE id = outboxMessageId
+
+If ListenNotifyService is unavailable when NOTIFY fires:
+
+OutboxRelayService (safety net, polling)
+    │
+    ├── SELECT * FROM outbox_messages WHERE processed_at IS NULL
+    ├── Publish to NATS
+    └── SET processed_at = now()
+
+Either path can run first; NATS JetStream MsgId dedup (= outbox id)
+makes a double-publish harmless if both fire for the same row.
