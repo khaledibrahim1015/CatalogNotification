@@ -1,0 +1,104 @@
+# docker-compose-nats.yml
+version: "3.9"
+
+networks:
+  backend-net:
+    driver: bridge 
+
+volumes:
+  nats1-data:
+  nats2-data:
+  nats3-data:
+
+
+
+services:
+  # ============================================
+  # NATS JetStream Cluster - 3 Node Raft
+  # ============================================
+  nats-1:
+    image: nats:2.10-alpine 
+    container_name: nats-1 
+    command: >
+      --config /etc/nats/nats-1.conf
+    ports:
+      - "4222:4222"   # NATS client
+      - "1883:1883"   # MQTT
+      - "8083:8080"   # WS
+      - "8222:8222"   # monitoring
+    env_file: .env
+    environment: 
+      - NODE_NAME=nats-1 
+
+    ulimits:
+      nofile:
+        soft: 131072
+        hard: 131072
+
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8222/healthz"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+    volumes:
+      - ../nats/nats-server/nats-1.conf:/etc/nats/nats-1.conf:ro
+      - nats1-data:/data/jetstream
+    networks:
+      - backend-net
+
+  nats-2:
+    image: nats:2.10-alpine 
+    container_name: nats-2
+    command: >
+      --config /etc/nats/nats-2.conf
+    ports:
+     - "8223:8222" # monitoring 
+    env_file: .env
+    environment: 
+      - NODE_NAME=nats-2
+    ulimits:
+      nofile:
+        soft: 131072
+        hard: 131072
+
+    volumes:
+      - ../nats/nats-server/nats-2.conf:/etc/nats/nats-2.conf:ro
+      - nats2-data:/data/jetstream
+    networks:
+      - backend-net
+    depends_on:
+      - nats-1
+
+  nats-3:
+    image: nats:2.10-alpine 
+    container_name: nats-3
+    command: >
+      --config /etc/nats/nats-3.conf
+    ports:
+     - "8224:8222"
+    env_file: .env
+    environment: 
+      - NODE_NAME=nats-3
+    ulimits:
+      nofile:
+        soft: 131072
+        hard: 131072
+
+    volumes:
+      - ../nats/nats-server/nats-3.conf:/etc/nats/nats-3.conf:ro
+      - nats3-data:/data/jetstream
+    networks:
+      - backend-net
+    depends_on:
+      - nats-1
+
+
+# this for nats-cli side conatiner 
+  nats-box:
+    image: natsio/nats-box:latest
+    container_name: nats-box
+    env_file: .env
+    networks:
+      - backend-net
+    entrypoint: ["sleep", "infinity"]

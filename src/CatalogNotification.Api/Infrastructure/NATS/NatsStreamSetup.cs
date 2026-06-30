@@ -159,12 +159,12 @@ public class NatsStreamSetup : INatsStreamSetup
             Name = streamName,
             Subjects = new[] { $"{subjectPrefix}.>" },
             Storage = StreamConfigStorage.File,
-            NumReplicas = 3,
+            NumReplicas = 3,   // 2 replicas in 3-node cluster
             Retention = StreamConfigRetention.Limits,
             Discard = StreamConfigDiscard.Old ,
             MaxMsgsPerSubject = maxMsgsPerSubject,
             MaxMsgs = -1,
-            MaxBytes = -1,
+            MaxBytes = -1, // Unlimited
             MaxMsgSize = -1,
             MaxAge = maxAge,
             DuplicateWindow = TimeSpan.FromMinutes(dedupWindowMinutes),
